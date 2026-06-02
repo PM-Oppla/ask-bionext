@@ -109,11 +109,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 # ── Header ─────────────────────────────────────────────────────────────────────
-st.markdown("""
+logo_url = "[raw.githubusercontent.com](https://raw.githubusercontent.com/PM-Oppla/ask-bionext/main/bionext-logo.png)"
+st.markdown(f"""
 <div class="bionext-header">
+  <img src="{logo_url}" height="55" style="margin-right:1rem; flex-shrink:0;">
   <div>
-    <h1>🌿 Ask BIONEXT</h1>
-    <p>Have a conversation with BIONEXT research · The Biodiversity Nexus: Transformative Change for Sustainability</p>
+    <h1 style="color:white; margin:0; font-size:1.8rem; font-weight:700;">Ask BIONEXT</h1>
+    <p style="color:#8A9A3A; margin:0; font-size:0.95rem;">Have a conversation with BIONEXT research · The Biodiversity Nexus: Transformative Change for Sustainability</p>
   </div>
 </div>
 """, unsafe_allow_html=True)
