@@ -16,9 +16,9 @@ st.markdown("""
 <style>
   /* Colour palette */
   :root {
-    --blue:  #1E3A5F;
-    --green: #B5CC18;
-    --light: #F4F6F8;
+    --blue:  #1A6B7C;
+    --green: #8A9A3A;
+    --light: #F0F5F5;
   }
   /* Header bar */
   .bionext-header {
