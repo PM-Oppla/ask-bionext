@@ -109,7 +109,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 # ── Header ─────────────────────────────────────────────────────────────────────
-logo_url = "[raw.githubusercontent.com](https://raw.githubusercontent.com/PM-Oppla/ask-bionext/main/bionext-logo.png)"
+logo_url = "https://raw.githubusercontent.com/PM-Oppla/ask-bionext/main/bionext-logo.png"
 st.markdown(f"""
 <div class="bionext-header">
   <img src="{logo_url}" height="55" style="margin-right:1rem; flex-shrink:0;">
