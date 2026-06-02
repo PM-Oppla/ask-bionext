@@ -30,18 +30,6 @@ st.markdown("""
     align-items: center;
     gap: 1.2rem;
   }
-  .bionext-header h1 {
-    color: white;
-    font-size: 1.8rem;
-    margin: 0;
-    font-weight: 700;
-  }
-  .bionext-header p {
-    color: var(--green);
-    margin: 0;
-    font-size: 0.95rem;
-    font-weight: 500;
-  }
   .user-msg {
     background-color: var(--blue);
     color: white;
@@ -116,43 +104,44 @@ if "drive_loaded" not in st.session_state:
 # ── Google Drive folder ID ─────────────────────────────────────────────────────
 DRIVE_FOLDER_ID = "1kYY0erFzaR5UNDG_px-gO442GUlHZYZo"
 
-# ── Fetch file list from Google Drive folder ───────────────────────────────────
+# ── Fetch file list from public Google Drive folder ────────────────────────────
 def get_drive_files(folder_id):
-    """Get list of files in a public Google Drive folder."""
+    """Scrape file IDs from a public Google Drive folder page."""
     url = f"[drive.google.com](https://drive.google.com/drive/folders/{folder_id})"
-    # Use the Drive API export for public folders
-    api_url = f"[googleapis.com](https://www.googleapis.com/drive/v3/files)"
-    params = {
-        "q": f"'{folder_id}' in parents",
-        "fields": "files(id,name,mimeType)",
-        "key": "AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY"  # public API key for metadata only
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = requests.get(api_url, params=params, timeout=10)
-        if r.status_code == 200:
-            return r.json().get("files", [])
-    except:
-        pass
-    return []
+        r = requests.get(url, headers=headers, timeout=15)
+        # Extract file IDs using regex pattern from Drive page source
+        ids_names = re.findall(r'"([a-zA-Z0-9_-]{33})","([^"]+\.[a-zA-Z]{2,5})"', r.text)
+        # Deduplicate
+        seen = set()
+        files = []
+        for fid, fname in ids_names:
+            if fid not in seen:
+                seen.add(fid)
+                files.append({"id": fid, "name": fname})
+        return files
+    except Exception as e:
+        return []
 
-# ── Download and extract text from a Drive file ────────────────────────────────
-def download_drive_file(file_id, filename):
+# ── Download file from Google Drive ───────────────────────────────────────────
+def download_drive_file(file_id):
     """Download a file from Google Drive by ID."""
     url = f"[drive.google.com](https://drive.google.com/uc?export=download&id={file_id})"
     try:
         session = requests.Session()
-        r = session.get(url, timeout=30)
-        # Handle Google's virus scan warning for large files
+        r = session.get(url, timeout=30, stream=True)
+        # Handle virus scan warning for larger files
         for key, value in r.cookies.items():
             if key.startswith("download_warning"):
-                params = {"id": file_id, "confirm": value}
-                r = session.get(url, params=params, timeout=30)
+                r = session.get(url, params={"confirm": value}, timeout=30)
+                break
         return io.BytesIO(r.content)
-    except Exception as e:
+    except Exception:
         return None
 
-def extract_text_from_bytes(file_bytes, filename):
-    """Extract text from file bytes based on extension."""
+# ── Extract text from file bytes ──────────────────────────────────────────────
+def extract_text(file_bytes, filename):
     name = filename.lower()
     try:
         if name.endswith(".pdf"):
@@ -174,39 +163,30 @@ def extract_text_from_bytes(file_bytes, filename):
             return "\n".join(lines)
         elif name.endswith((".txt", ".csv", ".md")):
             return file_bytes.read().decode("utf-8", errors="ignore")
-    except Exception as e:
+    except Exception:
         return ""
     return ""
 
-# ── Smart retrieval: find most relevant docs for a question ───────────────────
+# ── Smart retrieval ────────────────────────────────────────────────────────────
 def get_relevant_docs(question, documents, top_n=5):
-    """Simple keyword-based relevance scoring to pick top N documents."""
-    question_words = set(re.sub(r'[^\w\s]', '', question.lower()).split())
-    # Remove common stop words
-    stop_words = {'what', 'how', 'why', 'when', 'where', 'who', 'which', 'is', 'are',
-                  'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or',
-                  'do', 'does', 'did', 'can', 'could', 'tell', 'me', 'about', 'any'}
-    question_words -= stop_words
-
+    stop_words = {'what','how','why','when','where','who','which','is','are','the',
+                  'a','an','in','on','at','to','for','of','and','or','do','does',
+                  'did','can','could','tell','me','about','any','please'}
+    question_words = set(re.sub(r'[^\w\s]', '', question.lower()).split()) - stop_words
     scores = {}
     for fname, text in documents.items():
         text_lower = text.lower()
-        score = sum(text_lower.count(word) for word in question_words)
-        # Boost score if keywords appear in filename
-        fname_lower = fname.lower()
-        score += sum(10 for word in question_words if word in fname_lower)
+        score = sum(text_lower.count(w) for w in question_words)
+        score += sum(10 for w in question_words if w in fname.lower())
         scores[fname] = score
-
-    # Sort by score, return top N (always include at least top 3)
     sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    top_docs = [fname for fname, score in sorted_docs[:top_n]]
-    return top_docs
+    return [f for f, s in sorted_docs[:top_n]]
 
-# ── Build context from most relevant documents ─────────────────────────────────
+# ── Build context ──────────────────────────────────────────────────────────────
 def build_context(question):
     if not st.session_state.documents:
         return "", []
-    relevant = get_relevant_docs(question, st.session_state.documents, top_n=5)
+    relevant = get_relevant_docs(question, st.session_state.documents)
     parts = []
     for fname in relevant:
         text = st.session_state.documents[fname]
@@ -220,16 +200,15 @@ SYSTEM_PROMPT = """You are 'Ask BIONEXT', an AI research assistant for the BIONE
 project exploring how biodiversity interconnects with climate, food, water, energy, transport,
 and health.
 
-Your role is to answer questions by drawing EXCLUSIVELY on the source documents provided.
+Answer questions by drawing EXCLUSIVELY on the source documents provided.
 Do not use any outside knowledge. If the answer is not in the sources, say so clearly.
 
-When you answer:
+For every answer:
 1. Ground every claim in the source documents
-2. At the end of each answer, list which source document(s) you drew from, formatted exactly like:
-   📄 Sources: [filename1], [filename2]
-3. Be clear, helpful, and accessible — users may be policymakers, researchers, or public
-4. If a question cannot be answered from the sources, say: "I don't have information on that
-   in the current BIONEXT documents. You may find more at bionext-project.eu"
+2. End with: 📄 Sources: [filename1], [filename2]
+3. Be clear and accessible — users may be policymakers, researchers, or public
+4. If unanswerable from sources: "I don't have information on that in the current
+   BIONEXT documents. You may find more at bionext-project.eu"
 
 Source documents:
 {context}
@@ -241,31 +220,33 @@ with st.sidebar:
 
     if not st.session_state.drive_loaded:
         if st.button("🔄 Load BIONEXT Documents"):
-            with st.spinner("Loading documents from BIONEXT library..."):
+            with st.spinner("Connecting to BIONEXT document library..."):
                 files = get_drive_files(DRIVE_FOLDER_ID)
                 if files:
                     progress = st.progress(0)
                     loaded = 0
+                    errors = 0
                     for i, f in enumerate(files):
                         name = f["name"]
-                        mime = f.get("mimeType", "")
-                        # Skip folders and unsupported types
-                        if mime == "application/vnd.google-apps.folder":
-                            continue
                         if not any(name.lower().endswith(ext) for ext in
-                                   [".pdf", ".docx", ".xlsx", ".txt", ".csv", ".md"]):
+                                   [".pdf",".docx",".xlsx",".txt",".csv",".md"]):
                             continue
-                        file_bytes = download_drive_file(f["id"], name)
+                        file_bytes = download_drive_file(f["id"])
                         if file_bytes:
-                            text = extract_text_from_bytes(file_bytes, name)
+                            text = extract_text(file_bytes, name)
                             if text.strip():
                                 st.session_state.documents[name] = text
                                 loaded += 1
-                        progress.progress((i + 1) / len(files))
+                            else:
+                                errors += 1
+                        progress.progress(min((i + 1) / max(len(files), 1), 1.0))
                     st.session_state.drive_loaded = True
-                    st.success(f"✓ Loaded {loaded} documents")
+                    if loaded > 0:
+                        st.success(f"✓ {loaded} documents loaded")
+                    else:
+                        st.error("No documents could be loaded. The folder may not be fully public.")
                 else:
-                    st.error("Could not access the BIONEXT document library. Check folder permissions.")
+                    st.error("Could not read the folder. Please ensure sharing is set to 'Anyone with the link'.")
     else:
         st.success(f"✓ {len(st.session_state.documents)} documents loaded")
 
@@ -276,20 +257,17 @@ with st.sidebar:
             st.markdown(f"📄 `{name}`")
 
     st.markdown("---")
-
-    # Also allow manual upload as fallback
-    st.markdown('<div class="sidebar-title">Or upload additional files</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-title">Or upload files manually</div>', unsafe_allow_html=True)
     uploaded = st.file_uploader(
-        "Upload files",
-        type=["pdf", "txt", "docx", "xlsx", "csv", "md"],
+        "Upload",
+        type=["pdf","txt","docx","xlsx","csv","md"],
         accept_multiple_files=True,
         label_visibility="collapsed"
     )
     if uploaded:
         for f in uploaded:
             if f.name not in st.session_state.documents:
-                file_bytes = io.BytesIO(f.read())
-                text = extract_text_from_bytes(file_bytes, f.name)
+                text = extract_text(io.BytesIO(f.read()), f.name)
                 if text:
                     st.session_state.documents[f.name] = text
                     st.success(f"✓ {f.name}")
@@ -304,9 +282,8 @@ if not st.session_state.messages:
     st.markdown("""
     <div class="assistant-msg">
     👋 Welcome! I'm <strong>Ask BIONEXT</strong> — your guide to BIONEXT project research.<br><br>
-    Click <strong>'Load BIONEXT Documents'</strong> in the sidebar to load the full document library,
-    then ask me anything about the project's findings, methods, or outputs. I'll answer based
-    exclusively on BIONEXT sources and tell you exactly where the information comes from.
+    Click <strong>'Load BIONEXT Documents'</strong> in the sidebar to load the document library,
+    then ask me anything about the project's findings, methods, or outputs.
     </div>
     """, unsafe_allow_html=True)
 
@@ -337,9 +314,8 @@ if send and user_input.strip():
         st.error("⚠️ No OpenAI API key found.")
     else:
         st.session_state.messages.append({"role": "user", "content": user_input})
-        context, sources_used = build_context(user_input)
+        context, _ = build_context(user_input)
         system = SYSTEM_PROMPT.format(context=context)
-
         with st.spinner("Searching BIONEXT research..."):
             try:
                 response = client.chat.completions.create(
