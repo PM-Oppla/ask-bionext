@@ -1,9 +1,10 @@
 import streamlit as st
 import openai
 import os
-from pathlib import Path
-import tempfile
-import json
+import io
+import re
+import requests
+
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Ask BIONEXT",
@@ -11,16 +12,15 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
 # ── Branding / CSS ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  /* Colour palette */
   :root {
     --blue:  #1A6B7C;
     --green: #8A9A3A;
     --light: #F0F5F5;
   }
-  /* Header bar */
   .bionext-header {
     background-color: var(--blue);
     padding: 1rem 2rem;
@@ -35,7 +35,6 @@ st.markdown("""
     font-size: 1.8rem;
     margin: 0;
     font-weight: 700;
-    letter-spacing: 0.02em;
   }
   .bionext-header p {
     color: var(--green);
@@ -43,7 +42,6 @@ st.markdown("""
     font-size: 0.95rem;
     font-weight: 500;
   }
-  /* Chat bubbles */
   .user-msg {
     background-color: var(--blue);
     color: white;
@@ -61,22 +59,6 @@ st.markdown("""
     font-size: 0.95rem;
     line-height: 1.6;
   }
-  .source-tag {
-    display: inline-block;
-    background-color: var(--green);
-    color: var(--blue);
-    font-size: 0.72rem;
-    font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 10px;
-    margin: 2px 3px;
-  }
-  .sources-line {
-    margin-top: 0.6rem;
-    font-size: 0.8rem;
-    color: #555;
-  }
-  /* Sidebar */
   [data-testid="stSidebar"] {
     background-color: var(--light);
     border-right: 3px solid var(--green);
@@ -87,12 +69,10 @@ st.markdown("""
     font-size: 1rem;
     margin-bottom: 0.4rem;
   }
-  /* Input box */
   .stTextInput input {
     border: 2px solid var(--blue) !important;
     border-radius: 8px !important;
   }
-  /* Send button */
   .stButton button {
     background-color: var(--blue) !important;
     color: white !important;
@@ -108,8 +88,9 @@ st.markdown("""
   footer {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
+
 # ── Header ─────────────────────────────────────────────────────────────────────
-logo_url = "https://raw.githubusercontent.com/PM-Oppla/ask-bionext/main/bionext-logo.png"
+logo_url = "[raw.githubusercontent.com](https://raw.githubusercontent.com/PM-Oppla/ask-bionext/main/bionext-logo.png)"
 st.markdown(f"""
 <div class="bionext-header">
   <img src="{logo_url}" height="55" style="margin-right:1rem; flex-shrink:0;">
@@ -119,18 +100,185 @@ st.markdown(f"""
   </div>
 </div>
 """, unsafe_allow_html=True)
+
 # ── API key ────────────────────────────────────────────────────────────────────
 api_key = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
 client = openai.OpenAI(api_key=api_key)
+
 # ── Session state ──────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "documents" not in st.session_state:
-    st.session_state.documents = {}   # filename → text content
-# ── Sidebar: document upload ───────────────────────────────────────────────────
+    st.session_state.documents = {}
+if "drive_loaded" not in st.session_state:
+    st.session_state.drive_loaded = False
+
+# ── Google Drive folder ID ─────────────────────────────────────────────────────
+DRIVE_FOLDER_ID = "1kYY0erFzaR5UNDG_px-gO442GUlHZYZo"
+
+# ── Fetch file list from Google Drive folder ───────────────────────────────────
+def get_drive_files(folder_id):
+    """Get list of files in a public Google Drive folder."""
+    url = f"[drive.google.com](https://drive.google.com/drive/folders/{folder_id})"
+    # Use the Drive API export for public folders
+    api_url = f"[googleapis.com](https://www.googleapis.com/drive/v3/files)"
+    params = {
+        "q": f"'{folder_id}' in parents",
+        "fields": "files(id,name,mimeType)",
+        "key": "AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY"  # public API key for metadata only
+    }
+    try:
+        r = requests.get(api_url, params=params, timeout=10)
+        if r.status_code == 200:
+            return r.json().get("files", [])
+    except:
+        pass
+    return []
+
+# ── Download and extract text from a Drive file ────────────────────────────────
+def download_drive_file(file_id, filename):
+    """Download a file from Google Drive by ID."""
+    url = f"[drive.google.com](https://drive.google.com/uc?export=download&id={file_id})"
+    try:
+        session = requests.Session()
+        r = session.get(url, timeout=30)
+        # Handle Google's virus scan warning for large files
+        for key, value in r.cookies.items():
+            if key.startswith("download_warning"):
+                params = {"id": file_id, "confirm": value}
+                r = session.get(url, params=params, timeout=30)
+        return io.BytesIO(r.content)
+    except Exception as e:
+        return None
+
+def extract_text_from_bytes(file_bytes, filename):
+    """Extract text from file bytes based on extension."""
+    name = filename.lower()
+    try:
+        if name.endswith(".pdf"):
+            import pypdf
+            reader = pypdf.PdfReader(file_bytes)
+            return "\n\n".join(p.extract_text() or "" for p in reader.pages)
+        elif name.endswith(".docx"):
+            import docx
+            doc = docx.Document(file_bytes)
+            return "\n".join(p.text for p in doc.paragraphs)
+        elif name.endswith(".xlsx"):
+            import openpyxl
+            wb = openpyxl.load_workbook(file_bytes, data_only=True)
+            lines = []
+            for ws in wb.worksheets:
+                lines.append(f"[Sheet: {ws.title}]")
+                for row in ws.iter_rows(values_only=True):
+                    lines.append("\t".join(str(c) if c is not None else "" for c in row))
+            return "\n".join(lines)
+        elif name.endswith((".txt", ".csv", ".md")):
+            return file_bytes.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        return ""
+    return ""
+
+# ── Smart retrieval: find most relevant docs for a question ───────────────────
+def get_relevant_docs(question, documents, top_n=5):
+    """Simple keyword-based relevance scoring to pick top N documents."""
+    question_words = set(re.sub(r'[^\w\s]', '', question.lower()).split())
+    # Remove common stop words
+    stop_words = {'what', 'how', 'why', 'when', 'where', 'who', 'which', 'is', 'are',
+                  'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or',
+                  'do', 'does', 'did', 'can', 'could', 'tell', 'me', 'about', 'any'}
+    question_words -= stop_words
+
+    scores = {}
+    for fname, text in documents.items():
+        text_lower = text.lower()
+        score = sum(text_lower.count(word) for word in question_words)
+        # Boost score if keywords appear in filename
+        fname_lower = fname.lower()
+        score += sum(10 for word in question_words if word in fname_lower)
+        scores[fname] = score
+
+    # Sort by score, return top N (always include at least top 3)
+    sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    top_docs = [fname for fname, score in sorted_docs[:top_n]]
+    return top_docs
+
+# ── Build context from most relevant documents ─────────────────────────────────
+def build_context(question):
+    if not st.session_state.documents:
+        return "", []
+    relevant = get_relevant_docs(question, st.session_state.documents, top_n=5)
+    parts = []
+    for fname in relevant:
+        text = st.session_state.documents[fname]
+        snippet = text[:8000] if len(text) > 8000 else text
+        parts.append(f"=== SOURCE: {fname} ===\n{snippet}\n")
+    return "\n".join(parts), relevant
+
+# ── System prompt ──────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are 'Ask BIONEXT', an AI research assistant for the BIONEXT project
+(The Biodiversity Nexus: Transformative Change for Sustainability) — a European Union research
+project exploring how biodiversity interconnects with climate, food, water, energy, transport,
+and health.
+
+Your role is to answer questions by drawing EXCLUSIVELY on the source documents provided.
+Do not use any outside knowledge. If the answer is not in the sources, say so clearly.
+
+When you answer:
+1. Ground every claim in the source documents
+2. At the end of each answer, list which source document(s) you drew from, formatted exactly like:
+   📄 Sources: [filename1], [filename2]
+3. Be clear, helpful, and accessible — users may be policymakers, researchers, or public
+4. If a question cannot be answered from the sources, say: "I don't have information on that
+   in the current BIONEXT documents. You may find more at bionext-project.eu"
+
+Source documents:
+{context}
+"""
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="sidebar-title">📂 BIONEXT Sources</div>', unsafe_allow_html=True)
-    st.markdown("Upload project documents to include as sources.")
+
+    if not st.session_state.drive_loaded:
+        if st.button("🔄 Load BIONEXT Documents"):
+            with st.spinner("Loading documents from BIONEXT library..."):
+                files = get_drive_files(DRIVE_FOLDER_ID)
+                if files:
+                    progress = st.progress(0)
+                    loaded = 0
+                    for i, f in enumerate(files):
+                        name = f["name"]
+                        mime = f.get("mimeType", "")
+                        # Skip folders and unsupported types
+                        if mime == "application/vnd.google-apps.folder":
+                            continue
+                        if not any(name.lower().endswith(ext) for ext in
+                                   [".pdf", ".docx", ".xlsx", ".txt", ".csv", ".md"]):
+                            continue
+                        file_bytes = download_drive_file(f["id"], name)
+                        if file_bytes:
+                            text = extract_text_from_bytes(file_bytes, name)
+                            if text.strip():
+                                st.session_state.documents[name] = text
+                                loaded += 1
+                        progress.progress((i + 1) / len(files))
+                    st.session_state.drive_loaded = True
+                    st.success(f"✓ Loaded {loaded} documents")
+                else:
+                    st.error("Could not access the BIONEXT document library. Check folder permissions.")
+    else:
+        st.success(f"✓ {len(st.session_state.documents)} documents loaded")
+
+    if st.session_state.documents:
+        st.markdown("---")
+        st.markdown('<div class="sidebar-title">Loaded sources</div>', unsafe_allow_html=True)
+        for name in sorted(st.session_state.documents.keys()):
+            st.markdown(f"📄 `{name}`")
+
+    st.markdown("---")
+
+    # Also allow manual upload as fallback
+    st.markdown('<div class="sidebar-title">Or upload additional files</div>', unsafe_allow_html=True)
     uploaded = st.file_uploader(
         "Upload files",
         type=["pdf", "txt", "docx", "xlsx", "csv", "md"],
@@ -140,93 +288,34 @@ with st.sidebar:
     if uploaded:
         for f in uploaded:
             if f.name not in st.session_state.documents:
-                text = extract_text(f)
+                file_bytes = io.BytesIO(f.read())
+                text = extract_text_from_bytes(file_bytes, f.name)
                 if text:
                     st.session_state.documents[f.name] = text
                     st.success(f"✓ {f.name}")
-    if st.session_state.documents:
-        st.markdown("---")
-        st.markdown('<div class="sidebar-title">Loaded sources</div>', unsafe_allow_html=True)
-        for name in st.session_state.documents:
-            st.markdown(f"📄 `{name}`")
+
     st.markdown("---")
     if st.button("🗑 Clear conversation"):
         st.session_state.messages = []
         st.rerun()
-# ── Text extraction ────────────────────────────────────────────────────────────
-def extract_text(file):
-    """Extract plain text from uploaded file."""
-    import io
-    name = file.name.lower()
-    try:
-        if name.endswith(".pdf"):
-            import pypdf
-            reader = pypdf.PdfReader(io.BytesIO(file.read()))
-            return "\n\n".join(p.extract_text() or "" for p in reader.pages)
-        elif name.endswith(".docx"):
-            import docx
-            doc = docx.Document(io.BytesIO(file.read()))
-            return "\n".join(p.text for p in doc.paragraphs)
-        elif name.endswith(".xlsx"):
-            import openpyxl
-            wb = openpyxl.load_workbook(io.BytesIO(file.read()), data_only=True)
-            lines = []
-            for ws in wb.worksheets:
-                lines.append(f"[Sheet: {ws.title}]")
-                for row in ws.iter_rows(values_only=True):
-                    lines.append("\t".join(str(c) if c is not None else "" for c in row))
-            return "\n".join(lines)
-        elif name.endswith(".csv"):
-            return file.read().decode("utf-8", errors="ignore")
-        else:
-            return file.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        st.warning(f"Could not read {file.name}: {e}")
-        return ""
-# ── Build context from documents ───────────────────────────────────────────────
-def build_context():
-    if not st.session_state.documents:
-        return ""
-    parts = []
-    for fname, text in st.session_state.documents.items():
-        # Trim very large docs to avoid token overflow
-        snippet = text[:6000] if len(text) > 6000 else text
-        parts.append(f"=== SOURCE: {fname} ===\n{snippet}\n")
-    return "\n".join(parts)
-# ── System prompt ───────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are 'Ask BIONEXT', an AI research assistant for the BIONEXT project 
-(The Biodiversity Nexus: Transformative Change for Sustainability) — a European Union research 
-project exploring how biodiversity interconnects with climate, food, water, energy, transport, 
-and health.
-Your role is to answer questions by drawing EXCLUSIVELY on the source documents provided to you. 
-Do not use any outside knowledge. If the answer is not in the sources, say so clearly.
-When you answer:
-1. Ground every claim in the source documents
-2. At the end of each answer, list which source document(s) you drew from, formatted exactly like this:
-   📄 Sources: [filename1], [filename2]
-3. Be clear, helpful, and accessible — users may be policymakers, researchers, or members of the public
-4. If a question cannot be answered from the sources, say: "I don't have information on that in the 
-   current BIONEXT documents. You may find more at bionext-project.eu"
-Context documents:
-{context}
-"""
+
 # ── Chat display ───────────────────────────────────────────────────────────────
-chat_container = st.container()
-with chat_container:
-    if not st.session_state.messages:
-        st.markdown("""
-        <div class="assistant-msg">
-        👋 Welcome! I'm <strong>Ask BIONEXT</strong> — your guide to BIONEXT project research.<br><br>
-        Upload your BIONEXT documents in the sidebar, then ask me anything about the project's findings, 
-        methods, or outputs. I'll answer based exclusively on the uploaded sources and tell you exactly 
-        where the information comes from.
-        </div>
-        """, unsafe_allow_html=True)
-    for msg in st.session_state.messages:
-        if msg["role"] == "user":
-            st.markdown(f'<div class="user-msg">{msg["content"]}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="assistant-msg">{msg["content"]}</div>', unsafe_allow_html=True)
+if not st.session_state.messages:
+    st.markdown("""
+    <div class="assistant-msg">
+    👋 Welcome! I'm <strong>Ask BIONEXT</strong> — your guide to BIONEXT project research.<br><br>
+    Click <strong>'Load BIONEXT Documents'</strong> in the sidebar to load the full document library,
+    then ask me anything about the project's findings, methods, or outputs. I'll answer based
+    exclusively on BIONEXT sources and tell you exactly where the information comes from.
+    </div>
+    """, unsafe_allow_html=True)
+
+for msg in st.session_state.messages:
+    if msg["role"] == "user":
+        st.markdown(f'<div class="user-msg">{msg["content"]}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="assistant-msg">{msg["content"]}</div>', unsafe_allow_html=True)
+
 # ── Input ──────────────────────────────────────────────────────────────────────
 st.markdown("---")
 col1, col2 = st.columns([5, 1])
@@ -239,16 +328,18 @@ with col1:
     )
 with col2:
     send = st.button("Ask →")
+
 # ── Response logic ─────────────────────────────────────────────────────────────
 if send and user_input.strip():
     if not st.session_state.documents:
-        st.warning("⚠️ Please upload at least one BIONEXT document in the sidebar first.")
+        st.warning("⚠️ Please load the BIONEXT documents first using the button in the sidebar.")
     elif not api_key:
-        st.error("⚠️ No OpenAI API key found. Add it to your Streamlit secrets.")
+        st.error("⚠️ No OpenAI API key found.")
     else:
         st.session_state.messages.append({"role": "user", "content": user_input})
-        context = build_context()
+        context, sources_used = build_context(user_input)
         system = SYSTEM_PROMPT.format(context=context)
+
         with st.spinner("Searching BIONEXT research..."):
             try:
                 response = client.chat.completions.create(
@@ -259,7 +350,7 @@ if send and user_input.strip():
                           for m in st.session_state.messages]
                     ],
                     temperature=0.2,
-                    max_tokens=1000
+                    max_tokens=1200
                 )
                 answer = response.choices[0].message.content
                 st.session_state.messages.append({"role": "assistant", "content": answer})
